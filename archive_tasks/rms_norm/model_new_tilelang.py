@@ -1,7 +1,14 @@
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
-from rms_norm.design.tile_level.rms_norm import rms_norm as tl_rms_norm
+_TASK_DIR = Path(__file__).resolve().parent
+if str(_TASK_DIR) not in sys.path:
+    sys.path.insert(0, str(_TASK_DIR))
+
+from design.tile_level.rms_norm import rms_norm as tl_rms_norm
 
 
 class ModelNew(nn.Module):
@@ -15,8 +22,7 @@ class ModelNew(nn.Module):
             m,
             n,
             eps=self.eps,
-            in_dtype=str(x.dtype).split(".")[-1],
-            out_dtype=str(x.dtype).split(".")[-1],
+            dtype=str(x.dtype).split(".")[-1],
         )
 
     def forward(self, x: torch.Tensor, gamma: torch.Tensor):
@@ -31,5 +37,8 @@ class ModelNew(nn.Module):
         gamma_1d = gamma.contiguous()
 
         kernel = self._build_kernel(x_2d)
-        y_2d = kernel(x_2d, gamma_1d)
-        return y_2d.reshape(original_shape)
+        y_2d, inv_rms_1d = kernel(x_2d, gamma_1d)
+        return (
+            y_2d.reshape(original_shape),
+            inv_rms_1d.reshape(*original_shape[:-1], 1),
+        )

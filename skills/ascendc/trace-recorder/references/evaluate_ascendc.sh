@@ -3,7 +3,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKDIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+find_workdir() {
+  if [[ -n "${WORKDIR:-}" ]]; then
+    echo "${WORKDIR}"
+    return 0
+  fi
+
+  local candidate="${SCRIPT_DIR}"
+  while [[ "${candidate}" != "/" ]]; do
+    if [[ -f "${candidate}/utils/verification_ascendc.py" ]]; then
+      echo "${candidate}"
+      return 0
+    fi
+    candidate="$(cd "${candidate}/.." && pwd)"
+  done
+
+  return 1
+}
+
+WORKDIR="$(find_workdir)" || {
+  echo "Unable to locate repository root containing utils/verification_ascendc.py" >&2
+  exit 1
+}
 
 SSH_TARGET="${SSH_TARGET:-ascend-box}"
 REMOTE_PORT="${REMOTE_PORT:-}"
@@ -19,7 +41,7 @@ ASCENDC_CLEAN_BUILD="${ASCENDC_CLEAN_BUILD:-1}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/evaluate_ascendc.sh [task]
+Usage: bash <path-to-trace-recorder>/references/evaluate_ascendc.sh [task]
 
 Arguments:
   task    Task directory to verify. Defaults to current_task.
@@ -38,11 +60,11 @@ Environment overrides:
                              and replaces the remote eval workdir before syncing
 
 Examples:
-  scripts/evaluate_ascendc.sh
-  scripts/evaluate_ascendc.sh current_task
-  REMOTE_EVAL_WORKDIR=workdir_remote_eval_wzz scripts/evaluate_ascendc.sh quant_matmul
-  ASCENDC_SOC_VERSION=Ascend910B3 scripts/evaluate_ascendc.sh current_task
-  ASCENDC_CLEAN_BUILD=1 scripts/evaluate_ascendc.sh matmul_leakyrelu
+  bash <path-to-trace-recorder>/references/evaluate_ascendc.sh
+  bash <path-to-trace-recorder>/references/evaluate_ascendc.sh current_task
+  REMOTE_EVAL_WORKDIR=workdir_remote_eval_wzz bash <path-to-trace-recorder>/references/evaluate_ascendc.sh quant_matmul
+  ASCENDC_SOC_VERSION=Ascend910B3 bash <path-to-trace-recorder>/references/evaluate_ascendc.sh current_task
+  ASCENDC_CLEAN_BUILD=1 bash <path-to-trace-recorder>/references/evaluate_ascendc.sh matmul_leakyrelu
 EOF
 }
 
@@ -57,6 +79,11 @@ ARCHIVE_NAME="workdir_${TIMESTAMP}.tar.gz"
 LOCAL_ARCHIVE="/tmp/${ARCHIVE_NAME}"
 REMOTE_ARCHIVE="/tmp/${ARCHIVE_NAME}"
 REMOTE_SESSION_DIR="${REMOTE_BASE_DIR}/${TIMESTAMP}"
+
+PYTHONPATH_PREFIX="${WORKDIR}"
+if [[ -d "${WORKDIR}/archive_tasks" ]]; then
+  PYTHONPATH_PREFIX="${WORKDIR}/archive_tasks:${PYTHONPATH_PREFIX}"
+fi
 
 if [[ ! -f "${WORKDIR}/utils/verification_ascendc.py" ]]; then
   echo "Missing verification script: ${WORKDIR}/utils/verification_ascendc.py" >&2
@@ -82,11 +109,15 @@ if python -c 'import torch; import torch_npu' >/dev/null 2>&1; then
   echo "Detected local Ascend environment, building kernel and running local verification"
   cd "${WORKDIR}"
   if [[ "${ASCENDC_CLEAN_BUILD}" == "1" ]]; then
-    python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}" --clean
+    PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
+      python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}" --clean
   else
-    python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}"
+    PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
+      python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}"
   fi
-  ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" python utils/verification_ascendc.py "${TASK}"
+  PYTHONPATH="${PYTHONPATH_PREFIX}${PYTHONPATH:+:${PYTHONPATH}}" \
+    ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
+    python utils/verification_ascendc.py "${TASK}"
   exit 0
 fi
 
@@ -166,11 +197,15 @@ cd "${CONTAINER_WORKDIR}"
 source set_env.sh
 cd "${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}"
 if [[ "${ASCENDC_CLEAN_BUILD}" == "1" ]]; then
+  PYTHONPATH="${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}/archive_tasks:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}\${PYTHONPATH:+:\${PYTHONPATH}}" \
   python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}" --clean
 else
+  PYTHONPATH="${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}/archive_tasks:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}\${PYTHONPATH:+:\${PYTHONPATH}}" \
   python utils/build_ascendc.py "${TASK}" -v "${ASCENDC_SOC_VERSION}"
 fi
-ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" python utils/verification_ascendc.py "${TASK}"
+PYTHONPATH="${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}/archive_tasks:${CONTAINER_WORKDIR}/${REMOTE_EVAL_WORKDIR}\${PYTHONPATH:+:\${PYTHONPATH}}" \
+ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}" \
+python utils/verification_ascendc.py "${TASK}"
 '
 EOF
 

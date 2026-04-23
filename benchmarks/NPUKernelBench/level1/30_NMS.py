@@ -1,12 +1,110 @@
-# torch_npu.npu_nms_v4(boxes, scores, max_output_size, iou_threshold, scores_threshold, pad_to_max_output_size=False) -> (Tensor, Tensor)
-# https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/%EF%BC%88beta%EF%BC%89torch_npu-npu_nms_v4.md
-
 import torch
 import torch.nn as nn
+import json
+import os
 
 class Model(nn.Module):
     """
     Model that performs Non-Maximum Suppression (NMS) on NPU.
+    Pytorch native implemention
+    def forward(self, boxes: torch.Tensor, scores: torch.Tensor,
+                max_output_size: int, iou_threshold: float,
+                scores_threshold: float, pad_to_max_output_size: bool = False):
+        boxes_f32 = boxes.float()
+        scores_f32 = scores.float()
+
+        score_mask = scores_f32 > scores_threshold
+        filtered_boxes = boxes_f32[score_mask]
+        filtered_scores = scores_f32[score_mask]
+        original_indices = torch.where(score_mask)[0]
+
+        if filtered_boxes.shape[0] == 0:
+            num_selected = torch.tensor(0, dtype=torch.int32, device=boxes.device)
+            if pad_to_max_output_size:
+                selected_indices = torch.zeros(max_output_size, dtype=torch.int32, device=boxes.device)
+            else:
+                selected_indices = torch.tensor([], dtype=torch.int32, device=boxes.device)
+            return selected_indices, num_selected
+
+        sorted_indices = torch.argsort(filtered_scores, descending=True)
+        sorted_boxes = filtered_boxes[sorted_indices]
+        sorted_original_indices = original_indices[sorted_indices]
+
+        num_boxes = sorted_boxes.shape[0]
+        selected_indices_list = []
+        suppressed = torch.zeros(num_boxes, dtype=torch.bool, device=boxes.device)
+
+        areas = (sorted_boxes[:, 2] - sorted_boxes[:, 0]) * (sorted_boxes[:, 3] - sorted_boxes[:, 1])
+
+        for i in range(num_boxes):
+            if suppressed[i]:
+                continue
+
+            selected_indices_list.append(sorted_original_indices[i].item())
+
+            if len(selected_indices_list) >= max_output_size:
+                break
+
+            # Vectorized IoU: current box vs all remaining unsuppressed boxes
+            rest = torch.arange(i + 1, num_boxes, device=boxes.device)
+            if rest.numel() == 0:
+                break
+            mask = ~suppressed[rest]
+            if not mask.any():
+                continue
+            candidates = rest[mask]
+
+            cur_box = sorted_boxes[i]
+            cand_boxes = sorted_boxes[candidates]
+
+            x1_inter = torch.maximum(cur_box[0].expand(cand_boxes.shape[0]), cand_boxes[:, 0])
+            y1_inter = torch.maximum(cur_box[1].expand(cand_boxes.shape[0]), cand_boxes[:, 1])
+            x2_inter = torch.minimum(cur_box[2].expand(cand_boxes.shape[0]), cand_boxes[:, 2])
+            y2_inter = torch.minimum(cur_box[3].expand(cand_boxes.shape[0]), cand_boxes[:, 3])
+
+            inter_area = torch.clamp(x2_inter - x1_inter, min=0) * torch.clamp(y2_inter - y1_inter, min=0)
+            union_area = areas[i] + areas[candidates] - inter_area
+            iou = inter_area / union_area.clamp(min=1e-6)
+
+            suppress_mask = iou >= iou_threshold
+            suppressed[candidates[suppress_mask]] = True
+
+        num_selected = len(selected_indices_list)
+
+        if pad_to_max_output_size:
+            selected_indices = torch.zeros(max_output_size, dtype=torch.int32, device=boxes.device)
+            if num_selected > 0:
+                selected_indices[:num_selected] = torch.tensor(selected_indices_list, dtype=torch.int32, device=boxes.device)
+        else:
+            if num_selected > 0:
+                selected_indices = torch.tensor(selected_indices_list, dtype=torch.int32, device=boxes.device)
+            else:
+                selected_indices = torch.tensor([], dtype=torch.int32, device=boxes.device)
+
+        num_selected_tensor = torch.tensor(num_selected, dtype=torch.int32, device=boxes.device)
+
+        return selected_indices, num_selected_tensor
+
+    def _compute_iou(self, box1: torch.Tensor, box2: torch.Tensor) -> float:
+        x1_inter = max(box1[0].item(), box2[0].item())
+        y1_inter = max(box1[1].item(), box2[1].item())
+        x2_inter = min(box1[2].item(), box2[2].item())
+        y2_inter = min(box1[3].item(), box2[3].item())
+
+        inter_width = max(0.0, x2_inter - x1_inter)
+        inter_height = max(0.0, y2_inter - y1_inter)
+        inter_area = inter_width * inter_height
+
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        union_area = area1 + area2 - inter_area
+
+        if union_area <= 0:
+            return 0.0
+
+        iou = inter_area / union_area
+        return iou.item()
     """
     def __init__(self):
         super(Model, self).__init__()
@@ -29,876 +127,39 @@ class Model(nn.Module):
             tuple: (selected_boxes_indices, num_selected_boxes)
         """
         import torch_npu
-        # Convert float thresholds to scalar tensors on the same device as input
         iou_threshold_tensor = torch.tensor(iou_threshold, dtype=torch.float32, device=boxes.device)
         scores_threshold_tensor = torch.tensor(scores_threshold, dtype=torch.float32, device=boxes.device)
         return torch_npu.npu_nms_v4(boxes, scores, max_output_size, iou_threshold_tensor,
                                      scores_threshold_tensor, pad_to_max_output_size=pad_to_max_output_size)
 
-INPUT_CASES = [{'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [100, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [100],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 100},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [256, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [256],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 256},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [512, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [512],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 512},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [1024, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [1024],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1024},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [2048, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [2048],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [4096, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [4096],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [8192, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [8192],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [8732, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [8732],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 200},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.01}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [10000, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [10000],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [16192, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [16192],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [8450, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [8450],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.45},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.25}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [21125, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [21125],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.45},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.25}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [100, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [100],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 100},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.3},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.1}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [1000, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [1000],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 300},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.7},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.001}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [2048, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [2048],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 100},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.4},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [4096, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [4096],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 500},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.6},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.01}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [8192, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [8192],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 2000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.001}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [100, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [100],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 100},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05},
-             {'dtype': 'bool',
-              'name': 'pad_to_max_output_size',
-              'required': False,
-              'type': 'attr',
-              'value': True}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [1000, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [1000],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 300},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05},
-             {'dtype': 'bool',
-              'name': 'pad_to_max_output_size',
-              'required': False,
-              'type': 'attr',
-              'value': True}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [2048, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [2048],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 100},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05},
-             {'dtype': 'bool',
-              'name': 'pad_to_max_output_size',
-              'required': False,
-              'type': 'attr',
-              'value': True}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [50, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [50],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 50},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [150, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [150],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 100},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [300, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [300],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 200},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [500, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [500],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 300},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [750, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [750],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 500},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [1234, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [1234],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 500},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [5678, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [5678],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [3456, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [3456],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 500},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [7890, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [7890],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float16',
-              'name': 'boxes',
-              'required': True,
-              'shape': [16384, 4],
-              'type': 'tensor'},
-             {'dtype': 'float16',
-              'name': 'scores',
-              'required': True,
-              'shape': [16384],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]},
- {'inputs': [{'dtype': 'float32',
-              'name': 'boxes',
-              'required': True,
-              'shape': [32768, 4],
-              'type': 'tensor'},
-             {'dtype': 'float32',
-              'name': 'scores',
-              'required': True,
-              'shape': [32768],
-              'type': 'tensor'},
-             {'dtype': 'int',
-              'name': 'max_output_size',
-              'required': True,
-              'type': 'attr',
-              'value': 1000},
-             {'dtype': 'float',
-              'name': 'iou_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.5},
-             {'dtype': 'float',
-              'name': 'scores_threshold',
-              'required': True,
-              'type': 'attr',
-              'value': 0.05}]}]
-
-_DTYPE_MAP = {
-    "float16": torch.float16,
-    "float32": torch.float32,
-    "float64": torch.float64,
-    "bfloat16": torch.bfloat16,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "int32": torch.int32,
-    "int64": torch.int64,
-    "uint8": torch.uint8,
-    "bool": torch.bool,
-}
-
-
-def _make_boxes(shape, dtype):
-    leading_shape = tuple(shape[:-1])
-    mins = torch.rand(*leading_shape, 2, dtype=torch.float32)
-    sizes = torch.rand(*leading_shape, 2, dtype=torch.float32) + 0.05
-    maxs = mins + sizes
-    boxes = torch.cat([mins, maxs], dim=-1)
-    return boxes.to(dtype=dtype)
-
-
-def _make_tensor(spec):
-    dtype = _DTYPE_MAP[spec["dtype"]]
-    shape = spec["shape"]
-    name = spec["name"]
-    value_range = spec.get("range")
-
-    if dtype == torch.bool:
-        return torch.randint(0, 2, tuple(shape), dtype=torch.int64).to(torch.bool)
-
-    if name in {"boxes", "bboxes", "gtboxes"} and shape and shape[-1] == 4 and dtype in {
-        torch.float16,
-        torch.float32,
-        torch.float64,
-        torch.bfloat16,
-    }:
-        return _make_boxes(shape, dtype)
-
-    if value_range is not None:
-        low, high = value_range
-        if dtype in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
-            high_exclusive = high + 1
-            return torch.randint(low, high_exclusive, tuple(shape), dtype=dtype)
-        return torch.empty(tuple(shape), dtype=dtype).uniform_(low, high)
-
-    if dtype in {torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8}:
-        return torch.randint(0, 17, tuple(shape), dtype=dtype)
-
-    return torch.randn(*shape, dtype=dtype)
-
-
-def _make_tensor_list(spec):
-    dtype = _DTYPE_MAP[spec["dtype"]]
-    return [torch.randn(*shape, dtype=dtype) for shape in spec["shapes"]]
-
-
-def _make_arg(spec):
-    spec_type = spec["type"]
-    if spec_type == "tensor":
-        return _make_tensor(spec)
-    if spec_type == "tensor_list":
-        return _make_tensor_list(spec)
-    if spec_type == "attr":
-        return spec["value"]
-    raise ValueError(f"Unsupported input spec type: {spec_type}")
-
 
 def get_input_groups():
+    json_path = os.path.join(os.path.dirname(__file__), "30_NMS.json")
+    with open(json_path, "r") as f:
+        cases = [json.loads(line) for line in f if line.strip()]
+    
     input_groups = []
-    for case in INPUT_CASES:
-        input_groups.append([_make_arg(spec) for spec in case["inputs"]])
+    for case in cases:
+        inputs = case["inputs"]
+        boxes_info = inputs[0]
+        scores_info = inputs[1]
+        max_output_size_info = inputs[2]
+        iou_threshold_info = inputs[3]
+        scores_threshold_info = inputs[4]
+        
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        dtype = dtype_map[boxes_info["dtype"]]
+        
+        boxes = torch.randn(boxes_info["shape"], dtype=dtype)
+        scores = torch.randn(scores_info["shape"], dtype=dtype)
+        max_output_size = max_output_size_info["value"]
+        iou_threshold = iou_threshold_info["value"]
+        scores_threshold = scores_threshold_info["value"]
+        input_groups.append([boxes, scores, max_output_size, iou_threshold, scores_threshold])
     return input_groups
 
 
